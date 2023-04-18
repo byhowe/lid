@@ -1,9 +1,8 @@
 mod power_supply;
 
 use std::io;
-use std::os::fd::AsRawFd;
 
-use mio::unix::SourceFd;
+use mio::event::Source;
 use mio::Events;
 use mio::Interest;
 use mio::Poll;
@@ -13,17 +12,13 @@ pub use power_supply::PowerSupply;
 
 fn main() -> io::Result<()>
 {
-    let mut power_supply = PowerSupply::new()?;
-
-    let socket = udev::MonitorBuilder::new()?
-        .match_subsystem("power_supply")?
-        .listen()?;
+    let mut power_supply = PowerSupply::new();
 
     let mut poll = Poll::new()?;
-    let mut events = Events::with_capacity(5);
+    let mut events = Events::with_capacity(1024);
 
-    poll.registry().register(
-        &mut SourceFd(&socket.as_raw_fd()),
+    power_supply.register(
+        poll.registry(),
         Token(0),
         Interest::READABLE | Interest::WRITABLE,
     )?;
@@ -31,11 +26,8 @@ fn main() -> io::Result<()>
     loop {
         poll.poll(&mut events, None)?;
         events.clear();
-        socket
-            .iter()
-            .for_each(|event| power_supply.set_device(event.device()));
+        power_supply.update()?;
 
-        power_supply.set_charging_status();
         if power_supply.charging_status_changed() {
             println!(
                 "Charging status changed: {}",

@@ -1,6 +1,11 @@
 use std::ffi::OsStr;
 use std::fmt::Display;
 use std::io;
+use std::os::fd::AsRawFd;
+
+use mio::event::Source;
+use mio::unix::SourceFd;
+use udev::MonitorSocket;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceType
@@ -66,54 +71,124 @@ impl Display for Status
 
 pub struct PowerSupply
 {
-    bat: udev::Device,
-    adp: udev::Device,
+    socket: Option<udev::MonitorSocket>,
+
+    bat: Option<udev::Device>,
+    adp: Option<udev::Device>,
 
     status: Status,
     status_changed: bool,
 }
 
+impl Source for PowerSupply
+{
+    fn register(
+        &mut self,
+        registry: &mio::Registry,
+        token: mio::Token,
+        interests: mio::Interest,
+    ) -> io::Result<()>
+    {
+        SourceFd(&self.monitor_socket()?.as_raw_fd()).register(registry, token, interests)
+    }
+
+    fn reregister(
+        &mut self,
+        registry: &mio::Registry,
+        token: mio::Token,
+        interests: mio::Interest,
+    ) -> io::Result<()>
+    {
+        SourceFd(&self.monitor_socket()?.as_raw_fd()).reregister(registry, token, interests)
+    }
+
+    fn deregister(&mut self, registry: &mio::Registry) -> io::Result<()>
+    {
+        SourceFd(&self.monitor_socket()?.as_raw_fd()).deregister(registry)
+    }
+}
+
 impl PowerSupply
 {
-    pub fn new() -> io::Result<Self>
+    #[must_use]
+    pub fn new() -> Self
+    {
+        Self {
+            socket: None,
+            bat: None,
+            adp: None,
+            status: Status::Unknown,
+            status_changed: true,
+        }
+    }
+
+    pub fn update(&mut self) -> io::Result<()>
+    {
+        self.monitor_socket()?
+            .iter()
+            .for_each(|event| self.set_device(event.device()));
+        self.current_charging_status()?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn charging_status_changed(&self) -> bool
+    {
+        self.status_changed
+    }
+
+    /// Returns the last charging status detected by the udev driver.
+    #[must_use]
+    pub fn charging_status(&self) -> Status
+    {
+        self.status
+    }
+
+    fn enumerate(&mut self) -> io::Result<()>
     {
         let mut enumerator = udev::Enumerator::new()?;
         enumerator.match_subsystem("power_supply")?;
-        let devices = enumerator
-            .scan_devices()?
-            .filter_map(|dev| Self::device_type(&dev).map(|t| (t, dev)))
-            .collect::<Vec<_>>();
+        let devices = enumerator.scan_devices()?.collect::<Vec<_>>();
 
         assert!(
             devices.len() == 2,
             "Failed to find two power supply devices!"
         );
 
-        Ok(Self {
-            bat: devices
-                .iter()
-                .find(|(dev_type, _)| *dev_type == DeviceType::Battery)
-                .unwrap()
-                .1
-                .clone(),
-            adp: devices
-                .iter()
-                .find(|(dev_type, _)| *dev_type == DeviceType::Adapter)
-                .unwrap()
-                .1
-                .clone(),
-            status: Status::Unknown,
-            status_changed: true,
-        })
+        devices.into_iter().for_each(|dev| self.set_device(dev));
+
+        Ok(())
     }
 
-    pub fn set_device(&mut self, dev: udev::Device)
+    fn monitor_socket(&mut self) -> io::Result<&MonitorSocket>
+    {
+        if self.socket.is_some() {
+            Ok(unsafe { self.socket.as_ref().unwrap_unchecked() })
+        } else {
+            self.socket = Some(
+                udev::MonitorBuilder::new()?
+                    .match_subsystem("power_supply")?
+                    .listen()?,
+            );
+            Ok(unsafe { self.socket.as_ref().unwrap_unchecked() })
+        }
+    }
+
+    fn set_device(&mut self, dev: udev::Device)
     {
         match Self::device_type(&dev) {
-            Some(DeviceType::Battery) => self.bat = dev,
-            Some(DeviceType::Adapter) => self.adp = dev,
+            Some(DeviceType::Battery) => self.bat = Some(dev),
+            Some(DeviceType::Adapter) => self.adp = Some(dev),
             None => todo!(),
         }
+    }
+
+    fn set_devices_if_not_set(&mut self) -> io::Result<()>
+    {
+        if self.bat.is_none() || self.adp.is_none() {
+            self.enumerate()?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -135,28 +210,29 @@ impl PowerSupply
         }
     }
 
-    #[must_use]
-    pub fn charging_status_changed(&self) -> bool
-    {
-        self.status_changed
-    }
-
     /// Fetch the current status and set the last charging status to the current
     /// one.
-    pub fn set_charging_status(&mut self)
+    fn current_charging_status(&mut self) -> io::Result<()>
     {
-        let status = match Status::read_from_adapter_device(&self.adp) {
-            Status::Unknown => Status::read_from_battery_device(&self.bat),
-            status => status,
-        };
+        self.set_devices_if_not_set()?;
+        let status =
+            match Status::read_from_adapter_device(unsafe { self.adp.as_ref().unwrap_unchecked() })
+            {
+                Status::Unknown => Status::read_from_battery_device(unsafe {
+                    self.bat.as_ref().unwrap_unchecked()
+                }),
+                status => status,
+            };
         self.status_changed = status != self.status;
         self.status = status;
+        Ok(())
     }
+}
 
-    /// Returns the last charging status detected by the udev driver.
-    #[must_use]
-    pub fn charging_status(&self) -> Status
+impl Default for PowerSupply
+{
+    fn default() -> Self
     {
-        self.status
+        Self::new()
     }
 }
